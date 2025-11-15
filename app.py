@@ -6,32 +6,74 @@ import socket
 import psutil
 import sqlite3
 import os
+import sys
 import logging
 import json
 import webbrowser
 import threading
 import time
 import configparser
-from concurrent.futures import ThreadPoolExecutor
+import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from openpyxl import Workbook
 from io import BytesIO
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-app = Flask(__name__)
+# 确定应用程序根目录
+isPackaged = not sys.argv[0].endswith('.py')
+if isPackaged:
+    # 应用程序已编译
+    APP_ROOT = os.path.dirname(os.path.abspath(sys.argv[0]))
+else:
+    # 应用程序未编译
+    APP_ROOT = os.path.dirname(os.path.abspath(__file__))
 
-# 读取配置文件
+app = Flask(__name__, template_folder=os.path.join(APP_ROOT, '.'), static_folder=os.path.join(APP_ROOT, 'static'))
+
 config = configparser.ConfigParser()
-config_path = os.path.join(os.path.dirname(__file__), 'config.ini')
+config_path = os.path.join(APP_ROOT, 'config.ini')
+logging.info(f"Application root directory: {APP_ROOT}")
+logging.info(f"Config file path: {config_path}")
+
+# 初始化默认配置
+DETECTION_PORTS = [22, 80, 443, 3389]
+WEB_SERVER_PORT = 5000
+SCAN_THREAD_COUNT = 10
+PRESET_IP_RANGES = []
+
+# 版本检查默认配置
+ENABLE_VERSION_CHECK = False
+VERSION_CHECK_URL = ''
+VERSION_CHECK_TIMEOUT = 5
+VERSION_CHECK_MAX_ATTEMPTS = 3
+
 if os.path.exists(config_path):
-    config.read(config_path)
-    # 获取端口列表
+    config.read(config_path, encoding='utf-8')
+    # 获取检测端口列表
     ports_str = config.get('Detection', 'Ports', fallback='22,80,443,3389')
     DETECTION_PORTS = list(map(int, ports_str.split(',')))
+    logging.info(f"Loaded detection ports from config: {DETECTION_PORTS}")
+    
+    # 获取Web服务器配置
+    WEB_SERVER_PORT = config.getint('WebServer', 'Port', fallback=5000)
+    SCAN_THREAD_COUNT = config.getint('WebServer', 'ThreadCount', fallback=10)
+    logging.info(f"Loaded web server config: port={WEB_SERVER_PORT}, thread count={SCAN_THREAD_COUNT}")
+    
+    # 获取预置IP段配置
+    ip_ranges_str = config.get('Scan', 'PresetIPRanges', fallback='')
+    PRESET_IP_RANGES = [ip_range.strip() for ip_range in ip_ranges_str.split(',') if ip_range.strip()]
+    logging.info(f"Loaded preset IP ranges: {PRESET_IP_RANGES}")
+    
+    # 获取版本检查配置
+    ENABLE_VERSION_CHECK = config.getboolean('VersionCheck', 'Enable', fallback=False)
+    VERSION_CHECK_URL = config.get('VersionCheck', 'URL', fallback='')
+    VERSION_CHECK_TIMEOUT = config.getint('VersionCheck', 'Timeout', fallback=5)
+    VERSION_CHECK_MAX_ATTEMPTS = config.getint('VersionCheck', 'MaxAttempts', fallback=3)
+    logging.info(f"Loaded version check config: enabled={ENABLE_VERSION_CHECK}, url={VERSION_CHECK_URL}, timeout={VERSION_CHECK_TIMEOUT}, max_attempts={VERSION_CHECK_MAX_ATTEMPTS}")
 else:
-    # 使用默认端口
-    DETECTION_PORTS = [22, 80, 443, 3389]
+    logging.info(f"Config file not found, using default settings")
 
 class MACVendorDatabase:
     def __init__(self, db_path):
@@ -78,7 +120,7 @@ class MACVendorDatabase:
         return "未知厂商"
 
 # 初始化MAC厂商数据库
-db_path = os.path.join(os.path.dirname(__file__), "mac.db")
+db_path = os.path.join(APP_ROOT, "mac.db")
 if os.path.exists(db_path):
     mac_vendor_db = MACVendorDatabase(db_path)
 else:
@@ -99,12 +141,12 @@ def check_port(ip, port):
 def ping_ip(ip):
     try:
         # 首先检查ARP表中是否存在该IP，存在则视为存活
-        arp_table = get_arp_table()
+        arp_table = get_arp_table(ip)  # 查询单个IP的ARP条目
         if ip in arp_table:
             return True, ip
         
         output = subprocess.check_output(
-            f"ping -n 1 -w 1000 {ip}",
+            f"ping -n 1 -w 500 {ip}",  # 减少ping超时时间到500ms
             shell=True,
             stderr=subprocess.STDOUT,
             text=True
@@ -146,11 +188,17 @@ def get_local_network_info():
         print(f"Failed to get local network info: {str(e)}")
     return local_networks
 
+# 缓存本地网络信息
+local_networks_cache = None
+
 def is_in_local_network(ip):
+    global local_networks_cache
     try:
-        local_networks = get_local_network_info()
+        # 只获取一次本地网络信息
+        if local_networks_cache is None:
+            local_networks_cache = get_local_network_info()
         ip_obj = ipaddress.IPv4Address(ip)
-        for network_info in local_networks:
+        for network_info in local_networks_cache:
             network = ipaddress.IPv4Network(network_info['network'])
             if ip_obj in network:
                 return True
@@ -158,11 +206,14 @@ def is_in_local_network(ip):
     except Exception:
         return False
 
-def get_arp_table():
+def get_arp_table(ip=None):
     arp_table = {}
     try:
+        cmd = "arp -a"
+        if ip:
+            cmd += f" {ip}"  # 查询单个IP的ARP条目，更快
         output = subprocess.check_output(
-            "arp -a",
+            cmd,
             shell=True,
             stderr=subprocess.STDOUT,
             encoding="cp437"
@@ -171,9 +222,9 @@ def get_arp_table():
         for line in output.split('\n'):
             match = re.search(r'(\d+\.\d+\.\d+\.\d+)\s+([0-9a-fA-F-]{17})', line)
             if match:
-                ip = match.group(1)
+                ip_addr = match.group(1)
                 mac = match.group(2).replace('-', ':')
-                arp_table[ip] = mac
+                arp_table[ip_addr] = mac
     except Exception as e:
         print(f"Failed to get ARP table: {str(e)}")
 
@@ -182,18 +233,18 @@ def get_arp_table():
 def get_hostname(ip):
     try:
         # Shorten timeouts for faster resolution
-        socket.setdefaulttimeout(1)
+        socket.setdefaulttimeout(0.5)  # 500ms timeout for DNS resolution
         hostname, aliases, ips = socket.gethostbyaddr(ip)
         return hostname
     except (socket.herror, socket.timeout):
         try:
             output = subprocess.check_output(
-                f"ping -a -n 1 -w 1000 {ip}",  # 1 second ping timeout
+                f"ping -a -n 1 -w 500 {ip}",  # 500ms ping timeout
                 shell=True,
                 stderr=subprocess.STDOUT,
                 text=True,
                 encoding="cp437",
-                timeout=2  # 2 seconds total timeout
+                timeout=1  # 1 second total timeout
             )
             
             # 解析ping -a的输出，支持中英文
@@ -227,8 +278,8 @@ def arp_scan(ip, arp_table=None):
             
             # Check ARP table only if it's a local network IP
             if is_in_local_network(ip):
-                # Refresh ARP table to get the latest entries
-                arp_table = get_arp_table()
+                # Get ARP entry for this specific IP only
+                arp_table = get_arp_table(ip)
                 if ip in arp_table:
                     mac = arp_table[ip]
                     vendor = mac_vendor_db.get_vendor(mac) if mac_vendor_db else "Unknown"
@@ -249,69 +300,78 @@ def arp_scan(ip, arp_table=None):
 def get_ip_list(ip_range):
     try:
         logging.info(f"Parsing IP range: {ip_range}")
-        # 支持CIDR格式 (192.168.1.0/24)
-        if '/' in ip_range:
-            network = ipaddress.IPv4Network(ip_range)
-            host_list = [str(ip) for ip in network.hosts()]
-            logging.info(f"Parsed CIDR range {ip_range} to {len(host_list)} host(s)")
-            logging.debug(f"Host list: {host_list}")
-            return host_list
-        # 支持范围格式 (192.168.1.1-192.168.1.100 或 192.168.1.1-100)
-        elif '-' in ip_range:
-            start_ip, end_part = ip_range.split('-')
-            start_ip = start_ip.strip()
-            end_part = end_part.strip()
-            logging.info(f"Range split: start={start_ip}, end={end_part}")
-            
-            # 解析起始IP的各个部分
-            start_parts = list(map(int, start_ip.split('.')))
-            if len(start_parts) != 4:
-                logging.error(f"Invalid start IP format: {start_ip}")
-                return []
-            logging.info(f"Start IP parts: {start_parts}")
-            
-            # 解析结束IP
-            if '.' in end_part:
-                # 完整结束IP格式
-                end_parts = list(map(int, end_part.split('.')))
-                if len(end_parts) != 4:
-                    logging.error(f"Invalid end IP format: {end_part}")
-                    return []
-                logging.info(f"End IP parts (full): {end_parts}")
-            else:
-                # 部分结束IP格式 (只包含最后一个octet)
-                end_parts = start_parts.copy()
-                end_parts[3] = int(end_part)
-                logging.info(f"End IP parts (partial): {end_parts}")
-            
-            # 检查IP地址是否有效
-            for octet in start_parts + end_parts:
-                if octet < 0 or octet > 255:
-                    logging.error(f"Invalid octet in IP: {octet}")
-                    return []
-            
-            # 转换为整数以便比较
-            start_int = (start_parts[0] << 24) | (start_parts[1] << 16) | (start_parts[2] << 8) | start_parts[3]
-            end_int = (end_parts[0] << 24) | (end_parts[1] << 16) | (end_parts[2] << 8) | end_parts[3]
-            logging.info(f"IP integers: start={start_int}, end={end_int}")
-            
-            if start_int > end_int:
-                logging.error("Start IP is greater than end IP")
-                return []
-            
-            # 生成IP列表
-            ip_list = []
-            for i in range(start_int, end_int + 1):
-                ip = f"{i >> 24 & 0xFF}.{i >> 16 & 0xFF}.{i >> 8 & 0xFF}.{i & 0xFF}"
-                ip_list.append(ip)
-            logging.info(f"Generated {len(ip_list)} IP address(es)")
-            return ip_list
-        # 支持单个IP格式
-        else:
-            # 检查IP是否有效
-            ip = ipaddress.IPv4Address(ip_range.strip())
-            logging.info(f"Parsed single IP: {ip}")
-            return [ip_range.strip()]
+        # 支持多段IP地址，使用分号分隔
+        ranges = [r.strip() for r in ip_range.split(';') if r.strip()]
+        all_ips = []
+        
+        for single_range in ranges:
+            try:
+                if '/' in single_range:
+                    # CIDR格式
+                    network = ipaddress.IPv4Network(single_range)
+                    host_list = [str(ip) for ip in network.hosts()]
+                    logging.info(f"Parsed CIDR range {single_range} to {len(host_list)} host(s)")
+                    all_ips.extend(host_list)
+                elif '-' in single_range:
+                    # 范围格式
+                    start_ip, end_part = single_range.split('-')
+                    start_ip = start_ip.strip()
+                    end_part = end_part.strip()
+                    logging.info(f"Range split: start={start_ip}, end={end_part}")
+                    
+                    start_parts = list(map(int, start_ip.split('.')))
+                    if len(start_parts) != 4:
+                        logging.error(f"Invalid start IP format: {start_ip}")
+                        continue
+                    
+                    # 解析结束IP
+                    if '.' in end_part:
+                        end_parts = list(map(int, end_part.split('.')))
+                        if len(end_parts) != 4:
+                            logging.error(f"Invalid end IP format: {end_part}")
+                            continue
+                    else:
+                        end_parts = start_parts.copy()
+                        end_parts[3] = int(end_part)
+                    
+                    # 检查IP地址是否有效
+                    valid = True
+                    for octet in start_parts + end_parts:
+                        if octet < 0 or octet > 255:
+                            logging.error(f"Invalid octet in IP: {octet}")
+                            valid = False
+                            break
+                    if not valid:
+                        continue
+                    
+                    # 转换为整数以便比较
+                    start_int = (start_parts[0] << 24) | (start_parts[1] << 16) | (start_parts[2] << 8) | start_parts[3]
+                    end_int = (end_parts[0] << 24) | (end_parts[1] << 16) | (end_parts[2] << 8) | end_parts[3]
+                    
+                    if start_int > end_int:
+                        logging.error("Start IP is greater than end IP in range: {single_range}")
+                        continue
+                    
+                    # 生成IP列表
+                    for i in range(start_int, end_int + 1):
+                        ip = f"{i >> 24 & 0xFF}.{i >> 16 & 0xFF}.{i >> 8 & 0xFF}.{i & 0xFF}"
+                        all_ips.append(ip)
+                    logging.info(f"Generated {end_int - start_int + 1} IP address(es) from range {single_range}")
+                else:
+                    # 单个IP格式
+                    ip = ipaddress.IPv4Address(single_range.strip())
+                    all_ips.append(str(ip))
+                    logging.info(f"Parsed single IP: {str(ip)}")
+            except Exception as e:
+                logging.error(f"Error parsing single range {single_range}: {e}", exc_info=True)
+                continue
+        
+        # 去重并返回
+        unique_ips = list(set(all_ips))
+        unique_ips.sort()  # 按IP地址排序
+        logging.info(f"Total unique IPs after parsing all ranges: {len(unique_ips)}")
+        logging.debug(f"Unique IP list: {unique_ips}")
+        return unique_ips
     except Exception as e:
         logging.error(f"Error parsing IP range: {e}", exc_info=True)
         return []
@@ -377,11 +437,73 @@ def export_results():
         }
     )
 
+@app.route('/preset-ip-ranges', methods=['GET'])
+def preset_ip_ranges():
+    """获取预置IP段配置"""
+    logging.info(f"Returning preset IP ranges: {PRESET_IP_RANGES}")
+    return jsonify({'ip_ranges': PRESET_IP_RANGES})
+
+@app.route('/version-check-config', methods=['GET'])
+def version_check_config():
+    """获取版本检查配置"""
+    logging.info(f"Returning version check config: enabled={ENABLE_VERSION_CHECK}, url={VERSION_CHECK_URL}, timeout={VERSION_CHECK_TIMEOUT}, max_attempts={VERSION_CHECK_MAX_ATTEMPTS}")
+    return jsonify({
+        'enable_version_check': ENABLE_VERSION_CHECK,
+        'version_check_url': VERSION_CHECK_URL,
+        'version_check_timeout': VERSION_CHECK_TIMEOUT,
+        'version_check_max_attempts': VERSION_CHECK_MAX_ATTEMPTS
+    })
+
+@app.route('/detection-ports', methods=['GET'])
+def detection_ports():
+    return jsonify(DETECTION_PORTS)
+
+@app.route('/detection-ports', methods=['POST'])
+def update_detection_ports():
+    global DETECTION_PORTS
+    new_ports = request.json.get('ports', [])
+    # Validate ports
+    try:
+        validated_ports = [int(port) for port in new_ports if 1 <= int(port) <= 65535]
+        if not validated_ports:
+            return jsonify({'error': 'No valid ports provided'}), 400
+        
+        # Update the global variable
+        DETECTION_PORTS = validated_ports
+        
+        # Update the config file
+        config['Detection']['Ports'] = ','.join(map(str, DETECTION_PORTS))
+        with open(config_path, 'w', encoding='utf-8') as f:
+            config.write(f)
+        
+        logging.info(f"Updated detection ports to: {DETECTION_PORTS}")
+        return jsonify({'success': True, 'ports': DETECTION_PORTS})
+    except (ValueError, KeyError) as e:
+        return jsonify({'error': str(e)}), 400
+
+@app.route('/version-check', methods=['GET'])
+def version_check():
+    """版本检查代理"""
+    try:
+        logging.info(f"Received /version-check request, proxying to: {VERSION_CHECK_URL}")
+        # 向NAS服务器发起请求
+        response = requests.get(VERSION_CHECK_URL, timeout=VERSION_CHECK_TIMEOUT)
+        # 确保响应状态码为200
+        response.raise_for_status()
+        logging.info(f"Proxy request successful, status code: {response.status_code}, content: {response.text.strip()}")
+        # 返回响应内容
+        return Response(response.content, mimetype=response.headers.get('Content-Type', 'text/plain'))
+    except Exception as e:
+        logging.error(f"版本检查代理错误: {str(e)}")
+        # 如果请求失败，返回空响应或错误信息
+        return Response('0.0', mimetype='text/plain')
+
 @app.route('/scan', methods=['POST'])
+
 def scan():
     data = request.get_json()
     ip_range = data.get('ip_range')
-    concurrency = data.get('concurrency', 50)
+    concurrency = data.get('concurrency', 100)  # 增加默认并发数到100
     logging.info(f"Received scan request: ip_range={ip_range}, concurrency={concurrency}")
 
     if not ip_range:
@@ -409,9 +531,10 @@ def scan():
         
         with ThreadPoolExecutor(max_workers=concurrency) as executor:
             future_to_ip = {executor.submit(arp_scan, ip, arp_table): ip for ip in ip_list}
-            for future in future_to_ip:
-                result_data = future.result()
+            # 使用as_completed()更快返回完成的结果
+            for future in as_completed(future_to_ip):
                 ip = future_to_ip[future]
+                result_data = future.result()
                 logging.info(f"Scan result for {ip}: {result_data}")
                 # 生成扫描结果消息
                 scan_result = {
@@ -437,6 +560,6 @@ if __name__ == '__main__':
     # Check if running in the main process (not the reloader)
     if os.environ.get('WERKZEUG_RUN_MAIN') != 'true':
         # Start browser in a separate thread after a short delay
-        threading.Timer(2.0, webbrowser.open, args=('http://localhost:5000/',)).start()
+        threading.Timer(2.0, webbrowser.open, args=(f'http://localhost:{WEB_SERVER_PORT}/',)).start()
     # Run Flask app
-    app.run(debug=True, host='localhost', port=5000)
+    app.run(debug=False, host='0.0.0.0', port=WEB_SERVER_PORT)
